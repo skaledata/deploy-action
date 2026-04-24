@@ -123,19 +123,31 @@ runs:
       id: deploy
       shell: bash
       run: |
-        RESPONSE=$(curl -sf -X POST \
-          "${{ inputs.api-url }}/clusters/${{ inputs.cluster-id }}/deploy-image" \
-          -H "Authorization: Bearer ${{ inputs.api-key }}" \
-          -H "Content-Type: application/json" \
-          -d '{"app_type": "${{ inputs.app-type }}", "image_tag": "${{ inputs.image-tag }}"}')
+        for ATTEMPT in 1 2 3; do
+          RESPONSE=$(curl -sw '\n%{http_code}' -X POST \
+            "${{ inputs.api-url }}/clusters/${{ inputs.cluster-id }}/deploy-image" \
+            -H "Authorization: Bearer ${{ inputs.api-key }}" \
+            -H "Content-Type: application/json" \
+            -d '{"app_type": "${{ inputs.app-type }}", "image_tag": "${{ inputs.image-tag }}"}')
 
-        if [ $? -ne 0 ]; then
-          echo "::error::Failed to trigger deploy via SkaleData API"
-          exit 1
-        fi
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
 
-        STATUS=$(echo "$RESPONSE" | jq -r .status)
-        IMAGE=$(echo "$RESPONSE" | jq -r .image)
+          if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "202" ]; then
+            break
+          elif [ "$HTTP_CODE" = "409" ] && [ "$ATTEMPT" -lt 3 ]; then
+            DETAIL=$(echo "$BODY" | jq -r '.detail // "Cluster busy"' 2>/dev/null || echo "Cluster busy")
+            echo "::warning::$DETAIL — retrying in 30s (attempt $ATTEMPT/3)"
+            sleep 30
+          else
+            DETAIL=$(echo "$BODY" | jq -r '.detail // "Unknown error"' 2>/dev/null || echo "HTTP $HTTP_CODE")
+            echo "::error::Deploy failed: $DETAIL (HTTP $HTTP_CODE)"
+            exit 1
+          fi
+        done
+
+        STATUS=$(echo "$BODY" | jq -r .status)
+        IMAGE=$(echo "$BODY" | jq -r .image)
 
         echo "status=$STATUS" >> "$GITHUB_OUTPUT"
         echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
