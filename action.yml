@@ -110,14 +110,18 @@ runs:
           done <<< "${{ inputs.build-args }}"
         fi
 
+        LATEST="${{ steps.auth.outputs.ar_url }}/${{ inputs.app-type }}:latest"
+
         docker build \
           -f "${{ inputs.dockerfile }}" \
           -t "$IMAGE" \
+          -t "$LATEST" \
           $BUILD_ARGS \
           "${{ inputs.context }}"
 
         docker push "$IMAGE"
-        echo "Built and pushed: $IMAGE"
+        docker push "$LATEST"
+        echo "Built and pushed: $IMAGE (also tagged :latest)"
 
     - name: Trigger deploy
       id: deploy
