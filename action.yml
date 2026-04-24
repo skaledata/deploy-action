@@ -1,0 +1,152 @@
+name: 'SkaleData Deploy'
+description: 'Build, push, and deploy a custom image to a SkaleData cluster'
+branding:
+  icon: 'upload-cloud'
+  color: 'blue'
+
+inputs:
+  api-key:
+    description: 'SkaleData API key (sdk_...)'
+    required: true
+  cluster-id:
+    description: 'Cluster public ID (from SkaleData console)'
+    required: true
+  app-type:
+    description: 'Application type (airflow, airbyte, docs, slackbot, superset, datahub)'
+    required: true
+    default: 'airflow'
+  image-tag:
+    description: 'Docker image tag (defaults to git SHA)'
+    required: false
+    default: ${{ github.sha }}
+  dockerfile:
+    description: 'Path to Dockerfile'
+    required: false
+    default: './Dockerfile'
+  context:
+    description: 'Docker build context directory'
+    required: false
+    default: '.'
+  build-args:
+    description: 'Docker build arguments (one per line, KEY=VALUE format)'
+    required: false
+    default: ''
+  api-url:
+    description: 'SkaleData API URL (override for dev/staging)'
+    required: false
+    default: 'https://api.skaledata.com'
+  skip-build:
+    description: 'Skip docker build/push, only trigger deploy (for pre-built images)'
+    required: false
+    default: 'false'
+
+outputs:
+  image:
+    description: 'Full image URI that was deployed'
+    value: ${{ steps.deploy.outputs.image }}
+  status:
+    description: 'Deploy status (deployed or upgrading)'
+    value: ${{ steps.deploy.outputs.status }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Validate inputs
+      shell: bash
+      run: |
+        if [[ -z "${{ inputs.api-key }}" ]]; then
+          echo "::error::api-key is required"
+          exit 1
+        fi
+        if [[ ! "${{ inputs.api-key }}" =~ ^sdk_ ]]; then
+          echo "::error::api-key must start with 'sdk_' (create one at Organization > API Keys)"
+          exit 1
+        fi
+        if [[ -z "${{ inputs.cluster-id }}" ]]; then
+          echo "::error::cluster-id is required"
+          exit 1
+        fi
+
+    - name: Get registry credentials
+      id: auth
+      shell: bash
+      run: |
+        CREDS=$(curl -sf -X POST \
+          "${{ inputs.api-url }}/clusters/${{ inputs.cluster-id }}/registry-token" \
+          -H "Authorization: Bearer ${{ inputs.api-key }}")
+
+        if [ $? -ne 0 ] || [ -z "$CREDS" ]; then
+          echo "::error::Failed to get registry credentials from SkaleData API"
+          exit 1
+        fi
+
+        echo "registry=$(echo "$CREDS" | jq -r .registry)" >> "$GITHUB_OUTPUT"
+        echo "ar_url=$(echo "$CREDS" | jq -r .artifact_registry_url)" >> "$GITHUB_OUTPUT"
+        echo "username=$(echo "$CREDS" | jq -r .username)" >> "$GITHUB_OUTPUT"
+
+        # Mask the token so it never appears in logs
+        TOKEN=$(echo "$CREDS" | jq -r .token)
+        echo "::add-mask::$TOKEN"
+        echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+    - name: Docker login
+      shell: bash
+      run: |
+        echo "${{ steps.auth.outputs.token }}" | \
+          docker login "${{ steps.auth.outputs.registry }}" \
+            -u "${{ steps.auth.outputs.username }}" \
+            --password-stdin
+
+    - name: Build and push image
+      if: inputs.skip-build != 'true'
+      shell: bash
+      run: |
+        IMAGE="${{ steps.auth.outputs.ar_url }}/${{ inputs.app-type }}:${{ inputs.image-tag }}"
+
+        BUILD_ARGS=""
+        if [ -n "${{ inputs.build-args }}" ]; then
+          while IFS= read -r arg; do
+            [ -n "$arg" ] && BUILD_ARGS="$BUILD_ARGS --build-arg $arg"
+          done <<< "${{ inputs.build-args }}"
+        fi
+
+        docker build \
+          -f "${{ inputs.dockerfile }}" \
+          -t "$IMAGE" \
+          $BUILD_ARGS \
+          "${{ inputs.context }}"
+
+        docker push "$IMAGE"
+        echo "Built and pushed: $IMAGE"
+
+    - name: Trigger deploy
+      id: deploy
+      shell: bash
+      run: |
+        RESPONSE=$(curl -sf -X POST \
+          "${{ inputs.api-url }}/clusters/${{ inputs.cluster-id }}/deploy-image" \
+          -H "Authorization: Bearer ${{ inputs.api-key }}" \
+          -H "Content-Type: application/json" \
+          -d '{"app_type": "${{ inputs.app-type }}", "image_tag": "${{ inputs.image-tag }}"}')
+
+        if [ $? -ne 0 ]; then
+          echo "::error::Failed to trigger deploy via SkaleData API"
+          exit 1
+        fi
+
+        STATUS=$(echo "$RESPONSE" | jq -r .status)
+        IMAGE=$(echo "$RESPONSE" | jq -r .image)
+
+        echo "status=$STATUS" >> "$GITHUB_OUTPUT"
+        echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+        if [ "$STATUS" = "upgrading" ]; then
+          echo "::notice::First custom image deploy — Terraform upgrade in progress (~3-5 min)"
+        else
+          echo "::notice::Rolling restart triggered — pods updating now"
+        fi
+
+    - name: Docker logout
+      if: always()
+      shell: bash
+      run: docker logout "${{ steps.auth.outputs.registry }}" 2>/dev/null || true
