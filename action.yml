@@ -225,17 +225,23 @@ runs:
         fi
 
         LATEST="${{ steps.auth.outputs.ar_url }}/${{ inputs.app-type }}:latest"
+        # SkaleData's helm chart pins defaultAirflowTag to "current" with
+        # imagePullPolicy: Always, so the rolling restart that deploy-image
+        # triggers will only pick up new code if :current actually moved.
+        CURRENT="${{ steps.auth.outputs.ar_url }}/${{ inputs.app-type }}:current"
 
         docker build \
           -f "${{ inputs.dockerfile }}" \
           -t "$IMAGE" \
           -t "$LATEST" \
+          -t "$CURRENT" \
           $BUILD_ARGS \
           "${{ inputs.context }}"
 
         docker push "$IMAGE"
         docker push "$LATEST"
-        echo "Built and pushed: $IMAGE (also tagged :latest)"
+        docker push "$CURRENT"
+        echo "Built and pushed: $IMAGE (also tagged :latest and :current)"
 
     - name: Trigger deploy
       id: deploy
