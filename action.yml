@@ -1,5 +1,5 @@
 name: 'SkaleData Deploy'
-description: 'Build, push, and deploy a custom image to a SkaleData cluster'
+description: 'Build/push image (if relevant files changed) and always sync DAGs to a SkaleData cluster'
 branding:
   icon: 'upload-cloud'
   color: 'blue'
@@ -36,17 +36,50 @@ inputs:
     required: false
     default: 'https://api.skaledata.com'
   skip-build:
-    description: 'Skip docker build/push, only trigger deploy (for pre-built images)'
+    description: 'Skip docker build/push and deploy-image, even when image-rebuild paths match (DAGs still upload)'
+    required: false
+    default: 'false'
+  image-rebuild-paths:
+    description: |
+      Newline-separated glob patterns. If any file changed in the push matches one of these
+      patterns, an image rebuild + deploy-image is triggered. DAGs are uploaded regardless.
+      When change detection isn't possible (workflow_dispatch, first push to branch, shallow
+      clone with no parent), the action defaults to rebuilding the image — safe fallback.
+    required: false
+    default: |
+      Dockerfile
+      requirements.txt
+      requirements/**
+      pyproject.toml
+      setup.py
+      setup.cfg
+      packages/**
+      plugins/**
+  dags-path:
+    description: 'Path to DAGs folder, packaged as tar.gz and uploaded to blob storage on every run.'
+    required: false
+    default: 'dags'
+  skip-dag-upload:
+    description: 'Skip the DAG sync upload. Use if you manage DAGs out-of-band (rare).'
     required: false
     default: 'false'
 
 outputs:
   image:
-    description: 'Full image URI that was deployed'
+    description: 'Full image URI that was deployed (empty if image was not rebuilt)'
     value: ${{ steps.deploy.outputs.image }}
   status:
-    description: 'Deploy status (deployed or upgrading)'
+    description: 'deploy-image status (deployed, upgrading, or skipped)'
     value: ${{ steps.deploy.outputs.status }}
+  image-rebuilt:
+    description: 'true if an image build + deploy-image ran this invocation, false otherwise'
+    value: ${{ steps.detect.outputs.image-rebuild }}
+  dag-files-uploaded:
+    description: 'Number of DAG files uploaded to blob storage (0 if skipped)'
+    value: ${{ steps.upload-dags.outputs.files-uploaded }}
+  dag-sync-url:
+    description: 'Blob storage URL DAGs synced to (empty if skipped)'
+    value: ${{ steps.upload-dags.outputs.sync-url }}
 
 runs:
   using: 'composite'
@@ -67,8 +100,88 @@ runs:
           exit 1
         fi
 
+    - name: Detect changed files
+      id: detect
+      shell: bash
+      env:
+        EVENT_NAME: ${{ github.event_name }}
+        BEFORE_SHA: ${{ github.event.before }}
+        AFTER_SHA: ${{ github.sha }}
+        PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        REBUILD_PATTERNS: ${{ inputs.image-rebuild-paths }}
+      run: |
+        set -u
+
+        # Resolve the diff base depending on event type.
+        BASE=""
+        case "$EVENT_NAME" in
+          pull_request|pull_request_target)
+            BASE="$PR_BASE_SHA"
+            ;;
+          push)
+            # github.event.before is all-zeros for the first push to a branch.
+            if [ -n "$BEFORE_SHA" ] && [ "$BEFORE_SHA" != "0000000000000000000000000000000000000000" ]; then
+              BASE="$BEFORE_SHA"
+            fi
+            ;;
+        esac
+
+        if [ -z "$BASE" ]; then
+          echo "::notice::No diff base available (event=$EVENT_NAME) — defaulting to image rebuild"
+          echo "image-rebuild=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # Ensure the base commit is fetched (default checkout depth may be 1).
+        if ! git cat-file -e "$BASE" 2>/dev/null; then
+          git fetch --no-tags --depth=1 origin "$BASE" 2>/dev/null || true
+        fi
+        if ! git cat-file -e "$BASE" 2>/dev/null; then
+          echo "::notice::Cannot resolve base SHA $BASE in local clone — defaulting to image rebuild"
+          echo "image-rebuild=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        CHANGED=$(git diff --name-only "$BASE" "$AFTER_SHA" || true)
+        if [ -z "$CHANGED" ]; then
+          echo "No changed files between $BASE and $AFTER_SHA — skipping image rebuild"
+          echo "image-rebuild=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # Match changed files against rebuild glob patterns. Use Python's fnmatch
+        # because bash globstar handling of ** in extglob is inconsistent across
+        # runners and doesn't naturally compose with negation/anchoring.
+        REBUILD=$(CHANGED_FILES="$CHANGED" REBUILD_PATTERNS="$REBUILD_PATTERNS" python3 -c "
+        import os, sys
+        from fnmatch import fnmatch
+        changed = [l.strip() for l in os.environ.get('CHANGED_FILES', '').splitlines() if l.strip()]
+        patterns = [p.strip() for p in os.environ.get('REBUILD_PATTERNS', '').splitlines() if p.strip() and not p.strip().startswith('#')]
+        def matches(path, pattern):
+            if '**' in pattern:
+                # Anchor on the prefix before '**' to match any file under that subtree.
+                prefix = pattern.split('**', 1)[0].rstrip('/')
+                return prefix == '' or path == prefix or path.startswith(prefix + '/')
+            return fnmatch(path, pattern)
+        for f in changed:
+            for p in patterns:
+                if matches(f, p):
+                    sys.stderr.write(f'match: {f} ~ {p}\n')
+                    print('true'); sys.exit(0)
+        print('false')
+        ")
+
+        if [ "$REBUILD" = "true" ]; then
+          echo "::notice::Detected changes to image-rebuild paths — building image"
+          echo "image-rebuild=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "::notice::Only DAG / non-image files changed — skipping image rebuild"
+          echo "image-rebuild=false" >> "$GITHUB_OUTPUT"
+        fi
+
     - name: Get registry credentials
       id: auth
+      if: steps.detect.outputs.image-rebuild == 'true' && inputs.skip-build != 'true'
       shell: bash
       run: |
         CREDS=$(curl -sf -X POST \
@@ -90,6 +203,7 @@ runs:
         echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
 
     - name: Docker login
+      if: steps.detect.outputs.image-rebuild == 'true' && inputs.skip-build != 'true'
       shell: bash
       run: |
         echo "${{ steps.auth.outputs.token }}" | \
@@ -98,7 +212,7 @@ runs:
             --password-stdin
 
     - name: Build and push image
-      if: inputs.skip-build != 'true'
+      if: steps.detect.outputs.image-rebuild == 'true' && inputs.skip-build != 'true'
       shell: bash
       run: |
         IMAGE="${{ steps.auth.outputs.ar_url }}/${{ inputs.app-type }}:${{ inputs.image-tag }}"
@@ -125,6 +239,7 @@ runs:
 
     - name: Trigger deploy
       id: deploy
+      if: steps.detect.outputs.image-rebuild == 'true' && inputs.skip-build != 'true'
       shell: bash
       run: |
         for ATTEMPT in 1 2 3; do
@@ -162,7 +277,56 @@ runs:
           echo "::notice::Rolling restart triggered — pods updating now"
         fi
 
+    - name: Mark deploy skipped
+      id: deploy-skip
+      if: steps.detect.outputs.image-rebuild != 'true' || inputs.skip-build == 'true'
+      shell: bash
+      run: |
+        echo "::notice::Image rebuild skipped (image-rebuild=${{ steps.detect.outputs.image-rebuild }}, skip-build=${{ inputs.skip-build }})"
+
+    - name: Upload DAGs
+      id: upload-dags
+      if: inputs.skip-dag-upload != 'true'
+      shell: bash
+      run: |
+        DAGS_PATH="${{ inputs.dags-path }}"
+        if [ ! -d "$DAGS_PATH" ]; then
+          echo "::notice::dags-path '$DAGS_PATH' does not exist — skipping DAG upload"
+          echo "files-uploaded=0" >> "$GITHUB_OUTPUT"
+          echo "sync-url=" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        ARCHIVE="$(mktemp -d)/dags.tar.gz"
+        # Use the parent dir so the tar contains "dags/..." entries — the API's
+        # extract_tar_files strips the leading "dags/" prefix.
+        PARENT="$(dirname "$DAGS_PATH")"
+        BASENAME="$(basename "$DAGS_PATH")"
+        tar -czf "$ARCHIVE" -C "$PARENT" "$BASENAME"
+
+        RESPONSE=$(curl -sw '\n%{http_code}' -X POST \
+          "${{ inputs.api-url }}/clusters/${{ inputs.cluster-id }}/upload-dags" \
+          -H "Authorization: Bearer ${{ inputs.api-key }}" \
+          -F "file=@${ARCHIVE};type=application/gzip" \
+          -F "app_type=${{ inputs.app-type }}")
+
+        HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+        BODY=$(echo "$RESPONSE" | sed '$d')
+
+        if [ "$HTTP_CODE" != "200" ]; then
+          DETAIL=$(echo "$BODY" | jq -r '.detail // "Unknown error"' 2>/dev/null || echo "HTTP $HTTP_CODE")
+          echo "::error::DAG upload failed: $DETAIL (HTTP $HTTP_CODE)"
+          exit 1
+        fi
+
+        COUNT=$(echo "$BODY" | jq -r .files_uploaded)
+        SYNC_URL=$(echo "$BODY" | jq -r .sync_url)
+
+        echo "files-uploaded=$COUNT" >> "$GITHUB_OUTPUT"
+        echo "sync-url=$SYNC_URL" >> "$GITHUB_OUTPUT"
+        echo "::notice::Uploaded $COUNT DAG file(s) to $SYNC_URL — pods will sync within 30s"
+
     - name: Docker logout
-      if: always()
+      if: always() && steps.auth.outputs.registry != ''
       shell: bash
       run: docker logout "${{ steps.auth.outputs.registry }}" 2>/dev/null || true
