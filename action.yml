@@ -290,47 +290,123 @@ runs:
       run: |
         echo "::notice::Image rebuild skipped (image-rebuild=${{ steps.detect.outputs.image-rebuild }}, skip-build=${{ inputs.skip-build }})"
 
-    - name: Upload DAGs
+    - name: Sync DAGs
       id: upload-dags
       if: inputs.skip-dag-upload != 'true'
       shell: bash
       run: |
+        set -euo pipefail
         DAGS_PATH="${{ inputs.dags-path }}"
         if [ ! -d "$DAGS_PATH" ]; then
-          echo "::notice::dags-path '$DAGS_PATH' does not exist — skipping DAG upload"
+          echo "::notice::dags-path '$DAGS_PATH' does not exist — skipping DAG sync"
           echo "files-uploaded=0" >> "$GITHUB_OUTPUT"
           echo "sync-url=" >> "$GITHUB_OUTPUT"
           exit 0
         fi
 
-        ARCHIVE="$(mktemp -d)/dags.tar.gz"
-        # Use the parent dir so the tar contains "dags/..." entries — the API's
-        # extract_tar_files strips the leading "dags/" prefix.
-        PARENT="$(dirname "$DAGS_PATH")"
-        BASENAME="$(basename "$DAGS_PATH")"
-        tar -czf "$ARCHIVE" -C "$PARENT" "$BASENAME"
-
-        RESPONSE=$(curl -sw '\n%{http_code}' -X POST \
-          "${{ inputs.api-url }}/clusters/${{ inputs.cluster-id }}/upload-dags" \
+        # 1. Ask the control plane for short-lived, prefix-scoped credentials.
+        #    Bytes never leave this runner via SkaleData — we upload straight
+        #    to the customer's S3/GCS/Blob.
+        CREDS=$(curl -sS -w '\n%{http_code}' -X POST \
+          "${{ inputs.api-url }}/clusters/${{ inputs.cluster-id }}/dag-sync-credentials" \
           -H "Authorization: Bearer ${{ inputs.api-key }}" \
-          -F "file=@${ARCHIVE};type=application/gzip" \
-          -F "app_type=${{ inputs.app-type }}")
-
-        HTTP_CODE=$(echo "$RESPONSE" | tail -1)
-        BODY=$(echo "$RESPONSE" | sed '$d')
-
-        if [ "$HTTP_CODE" != "200" ]; then
-          DETAIL=$(echo "$BODY" | jq -r '.detail // "Unknown error"' 2>/dev/null || echo "HTTP $HTTP_CODE")
-          echo "::error::DAG upload failed: $DETAIL (HTTP $HTTP_CODE)"
+          -H "Content-Type: application/json" \
+          -d "{\"app_type\":\"${{ inputs.app-type }}\"}")
+        CREDS_CODE=$(echo "$CREDS" | tail -1)
+        CREDS_BODY=$(echo "$CREDS" | sed '$d')
+        if [ "$CREDS_CODE" != "200" ]; then
+          DETAIL=$(echo "$CREDS_BODY" | jq -r '.detail // "Unknown error"' 2>/dev/null || echo "HTTP $CREDS_CODE")
+          echo "::error::Failed to mint DAG sync credentials: $DETAIL (HTTP $CREDS_CODE)"
           exit 1
         fi
 
-        COUNT=$(echo "$BODY" | jq -r .files_uploaded)
-        SYNC_URL=$(echo "$BODY" | jq -r .sync_url)
+        PROVIDER=$(echo "$CREDS_BODY" | jq -r .provider)
+        BUCKET=$(echo "$CREDS_BODY" | jq -r .bucket)
+        PREFIX=$(echo "$CREDS_BODY" | jq -r .prefix)
+        REGION=$(echo "$CREDS_BODY" | jq -r '.region // ""')
+        SYNC_URL=$(echo "$CREDS_BODY" | jq -r .sync_url)
 
-        echo "files-uploaded=$COUNT" >> "$GITHUB_OUTPUT"
+        # 2. Cloud-native sync. Each tool is incremental — after the first
+        #    run, subsequent deploys only upload changed files.
+        case "$PROVIDER" in
+          aws)
+            AWS_ACCESS_KEY_ID=$(echo "$CREDS_BODY" | jq -r .credentials.access_key_id)
+            AWS_SECRET_ACCESS_KEY=$(echo "$CREDS_BODY" | jq -r .credentials.secret_access_key)
+            AWS_SESSION_TOKEN=$(echo "$CREDS_BODY" | jq -r .credentials.session_token)
+            echo "::add-mask::$AWS_SECRET_ACCESS_KEY"
+            echo "::add-mask::$AWS_SESSION_TOKEN"
+            export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
+            export AWS_DEFAULT_REGION="$REGION"
+            aws s3 sync "$DAGS_PATH/" "s3://${BUCKET}/${PREFIX}" \
+              --delete \
+              --exclude "._*" \
+              --exclude ".DS_Store" \
+              --exclude "*/__pycache__/*" \
+              --exclude "*.pyc"
+            ;;
+          gcp)
+            ACCESS_TOKEN=$(echo "$CREDS_BODY" | jq -r .credentials.access_token)
+            echo "::add-mask::$ACCESS_TOKEN"
+            TOKEN_FILE="$(mktemp)"
+            trap 'rm -f "$TOKEN_FILE"' EXIT
+            printf '%s' "$ACCESS_TOKEN" > "$TOKEN_FILE"
+            # `gcloud storage rsync` needs SDK >= 449 (Sept 2023). GitHub
+            # runners ship a newer version by default.
+            gcloud storage rsync "$DAGS_PATH/" "gs://${BUCKET}/${PREFIX}" \
+              --recursive \
+              --delete-unmatched-destination-objects \
+              --access-token-file="$TOKEN_FILE" \
+              --exclude '(^|/)\._.*$' \
+              --exclude '(^|/)\.DS_Store$' \
+              --exclude '__pycache__' \
+              --exclude '\.pyc$'
+            ;;
+          azure)
+            SAS_URL=$(echo "$CREDS_BODY" | jq -r .credentials.sas_url)
+            echo "::add-mask::$SAS_URL"
+            # `az storage blob upload-batch` parallel-uploads but does NOT
+            # delete remote files that were removed locally. `azcopy sync`
+            # would; install it if you need delete-on-removal.
+            # Build the destination URL with the prefix path inserted before
+            # the SAS query string.
+            BASE_URL="${SAS_URL%%\?*}"
+            SAS_QUERY="${SAS_URL#*\?}"
+            az storage blob upload-batch \
+              --source "$DAGS_PATH" \
+              --destination "${BASE_URL}" \
+              --destination-path "${PREFIX%/}" \
+              --sas-token "$SAS_QUERY" \
+              --overwrite true \
+              --pattern '*' \
+              --no-progress
+            ;;
+          *)
+            echo "::error::Unknown cloud provider '$PROVIDER' returned by control plane"
+            exit 1
+            ;;
+        esac
+
+        FILE_COUNT=$(find "$DAGS_PATH" -type f \
+          ! -name '._*' ! -name '.DS_Store' \
+          ! -path '*/__pycache__/*' ! -name '*.pyc' \
+          | wc -l | tr -d ' ')
+
+        # 3. Tell the control plane the sync happened so it can update
+        #    deploy_mode + last_dag_sync_at. Best-effort: a failed callback
+        #    leaves the data in place, only the bookkeeping drifts.
+        COMPLETE=$(curl -sS -w '\n%{http_code}' -X POST \
+          "${{ inputs.api-url }}/clusters/${{ inputs.cluster-id }}/dag-sync-complete" \
+          -H "Authorization: Bearer ${{ inputs.api-key }}" \
+          -H "Content-Type: application/json" \
+          -d "{\"app_type\":\"${{ inputs.app-type }}\",\"files_uploaded\":${FILE_COUNT}}" || true)
+        COMPLETE_CODE=$(echo "$COMPLETE" | tail -1)
+        if [ "$COMPLETE_CODE" != "200" ]; then
+          echo "::warning::DAGs uploaded but control-plane callback returned HTTP $COMPLETE_CODE"
+        fi
+
+        echo "files-uploaded=$FILE_COUNT" >> "$GITHUB_OUTPUT"
         echo "sync-url=$SYNC_URL" >> "$GITHUB_OUTPUT"
-        echo "::notice::Uploaded $COUNT DAG file(s) to $SYNC_URL — pods will sync within 30s"
+        echo "::notice::Synced $FILE_COUNT DAG file(s) to $SYNC_URL — pods will sync within 30s"
 
     - name: Docker logout
       if: always() && steps.auth.outputs.registry != ''
