@@ -89,6 +89,14 @@ inputs:
         target/index.html
     required: false
     default: ''
+  verbose-sync:
+    description: |
+      When false (default), the underlying cloud sync tool runs with errors-only
+      verbosity — a clean run prints one summary notice. Set to 'true' to surface
+      the full per-file upload/delete output (still wrapped in a collapsible
+      ::group:: in the GitHub Actions log).
+    required: false
+    default: 'false'
 
 outputs:
   image:
@@ -324,6 +332,7 @@ runs:
         RESPECT_GITIGNORE: ${{ inputs.respect-gitignore }}
         EXTRA_EXCLUDES: ${{ inputs.extra-excludes }}
         EXTRA_INCLUDES: ${{ inputs.extra-includes }}
+        VERBOSE_SYNC: ${{ inputs.verbose-sync }}
       run: |
         set -euo pipefail
         DAGS_PATH="${{ inputs.dags-path }}"
@@ -422,6 +431,22 @@ runs:
         # 4. Cloud-native sync from the (possibly staged) source set. Each
         #    tool is incremental — after the first run, subsequent deploys
         #    only upload changed files.
+        #
+        #    Verbosity: per-file output is suppressed by default (each CLI's
+        #    own quiet flag); set verbose-sync=true to see it. Either way
+        #    the lines are wrapped in a ::group:: so they're collapsible in
+        #    the GH Actions log.
+        if [ "$VERBOSE_SYNC" = "true" ]; then
+          AWS_QUIET=()
+          GCS_QUIET=()
+          AZ_QUIET=()
+        else
+          AWS_QUIET=(--only-show-errors)
+          GCS_QUIET=(--verbosity=error)
+          AZ_QUIET=(--only-show-errors --no-progress)
+        fi
+
+        echo "::group::cloud sync output"
         case "$PROVIDER" in
           aws)
             AWS_ACCESS_KEY_ID=$(echo "$CREDS_BODY" | jq -r .credentials.access_key_id)
@@ -436,7 +461,8 @@ runs:
               --exclude "._*" \
               --exclude ".DS_Store" \
               --exclude "*/__pycache__/*" \
-              --exclude "*.pyc"
+              --exclude "*.pyc" \
+              "${AWS_QUIET[@]}"
             ;;
           gcp)
             ACCESS_TOKEN=$(echo "$CREDS_BODY" | jq -r .credentials.access_token)
@@ -453,7 +479,8 @@ runs:
               --exclude '(^|/)\._.*$' \
               --exclude '(^|/)\.DS_Store$' \
               --exclude '__pycache__' \
-              --exclude '\.pyc$'
+              --exclude '\.pyc$' \
+              "${GCS_QUIET[@]}"
             ;;
           azure)
             SAS_URL=$(echo "$CREDS_BODY" | jq -r .credentials.sas_url)
@@ -472,13 +499,14 @@ runs:
               --sas-token "$SAS_QUERY" \
               --overwrite true \
               --pattern '*' \
-              --no-progress
+              "${AZ_QUIET[@]}"
             ;;
           *)
             echo "::error::Unknown cloud provider '$PROVIDER' returned by control plane"
             exit 1
             ;;
         esac
+        echo "::endgroup::"
 
         FILE_COUNT=$(find "$SRC" -type f \
           ! -name '._*' ! -name '.DS_Store' \
