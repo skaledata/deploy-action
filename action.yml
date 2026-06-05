@@ -63,6 +63,32 @@ inputs:
     description: 'Skip the DAG sync upload. Use if you manage DAGs out-of-band (rare).'
     required: false
     default: 'false'
+  respect-gitignore:
+    description: |
+      When true (default), only files git would consider "tracked or untracked-but-not-ignored"
+      are synced. Honors nested .gitignore files exactly like git itself. Set to 'false' to
+      ship everything under dags-path regardless of .gitignore.
+    required: false
+    default: 'true'
+  extra-excludes:
+    description: |
+      Newline-separated list of file/dir names to exclude in addition to .gitignore. Matched
+      against the basename anywhere in the tree (`find -name`). Trailing slash means
+      "directory of that name". Example:
+        target/
+        build/
+        secrets.json
+    required: false
+    default: ''
+  extra-includes:
+    description: |
+      Newline-separated list of path globs (relative to dags-path) to re-add even if
+      .gitignore would skip them. Useful when CI generates files into a gitignored dir
+      that you actually want shipped. Example:
+        dbt_packages/manifest.json
+        target/index.html
+    required: false
+    default: ''
 
 outputs:
   image:
@@ -294,6 +320,10 @@ runs:
       id: upload-dags
       if: inputs.skip-dag-upload != 'true'
       shell: bash
+      env:
+        RESPECT_GITIGNORE: ${{ inputs.respect-gitignore }}
+        EXTRA_EXCLUDES: ${{ inputs.extra-excludes }}
+        EXTRA_INCLUDES: ${{ inputs.extra-includes }}
       run: |
         set -euo pipefail
         DAGS_PATH="${{ inputs.dags-path }}"
@@ -304,7 +334,70 @@ runs:
           exit 0
         fi
 
-        # 1. Ask the control plane for short-lived, prefix-scoped credentials.
+        # 1. Build the source set. We pre-stage into a tmp dir when any
+        #    filtering is requested — one consistent code path that works for
+        #    aws/gcs/azure (each CLI's --exclude dialect is different and
+        #    none of them understand nested .gitignore files).
+        SRC="$DAGS_PATH"
+        IN_GIT_REPO=false
+        git -C "$DAGS_PATH" rev-parse --git-dir >/dev/null 2>&1 && IN_GIT_REPO=true
+
+        NEED_STAGE=false
+        [ "$RESPECT_GITIGNORE" = "true" ] && $IN_GIT_REPO && NEED_STAGE=true
+        [ -n "${EXTRA_INCLUDES// /}" ] && NEED_STAGE=true
+        [ -n "${EXTRA_EXCLUDES// /}" ] && NEED_STAGE=true
+
+        if $NEED_STAGE; then
+          STAGE="$(mktemp -d)/sync"
+          mkdir -p "$STAGE"
+          if [ "$RESPECT_GITIGNORE" = "true" ] && $IN_GIT_REPO; then
+            # Tracked + untracked-but-not-ignored. Honors nested .gitignore.
+            git -C "$DAGS_PATH" ls-files --cached --others --exclude-standard -z \
+              | rsync --files-from=- --from0 -a "$DAGS_PATH/" "$STAGE/"
+            echo "::notice::Pre-staged source via .gitignore filter"
+          else
+            rsync -a "$DAGS_PATH/" "$STAGE/"
+          fi
+
+          # extra-includes: copy any matching paths back into the stage
+          if [ -n "${EXTRA_INCLUDES// /}" ]; then
+            while IFS= read -r pat; do
+              [ -z "$pat" ] && continue
+              (cd "$DAGS_PATH" && find . -path "./$pat" -type f -print0 2>/dev/null) | \
+                while IFS= read -r -d '' f; do
+                  rel="${f#./}"
+                  mkdir -p "$STAGE/$(dirname "$rel")"
+                  cp "$DAGS_PATH/$rel" "$STAGE/$rel"
+                done
+            done <<< "$EXTRA_INCLUDES"
+          fi
+
+          # extra-excludes: prune from the stage. Trailing-slash means
+          # "directory of that name."
+          if [ -n "${EXTRA_EXCLUDES// /}" ]; then
+            while IFS= read -r pat; do
+              [ -z "$pat" ] && continue
+              if [[ "$pat" == */ ]]; then
+                find "$STAGE" -type d -name "${pat%/}" -exec rm -rf {} + 2>/dev/null || true
+              else
+                find "$STAGE" -name "$pat" -delete 2>/dev/null || true
+              fi
+            done <<< "$EXTRA_EXCLUDES"
+          fi
+
+          # Baseline cleanup: macOS resource forks, DS_Store, pyc/pycache.
+          find "$STAGE" -name '._*' -delete 2>/dev/null || true
+          find "$STAGE" -name '.DS_Store' -delete 2>/dev/null || true
+          find "$STAGE" -type d -name '__pycache__' -exec rm -rf {} + 2>/dev/null || true
+          find "$STAGE" -name '*.pyc' -delete 2>/dev/null || true
+
+          SRC="$STAGE"
+        fi
+
+        STAGED_COUNT=$(find "$SRC" -type f 2>/dev/null | wc -l | tr -d ' ')
+        echo "::notice::Source set: $STAGED_COUNT files ready to sync"
+
+        # 3. Ask the control plane for short-lived, prefix-scoped credentials.
         #    Bytes never leave this runner via SkaleData — we upload straight
         #    to the customer's S3/GCS/Blob.
         CREDS=$(curl -sS -w '\n%{http_code}' -X POST \
@@ -326,8 +419,9 @@ runs:
         REGION=$(echo "$CREDS_BODY" | jq -r '.region // ""')
         SYNC_URL=$(echo "$CREDS_BODY" | jq -r .sync_url)
 
-        # 2. Cloud-native sync. Each tool is incremental — after the first
-        #    run, subsequent deploys only upload changed files.
+        # 4. Cloud-native sync from the (possibly staged) source set. Each
+        #    tool is incremental — after the first run, subsequent deploys
+        #    only upload changed files.
         case "$PROVIDER" in
           aws)
             AWS_ACCESS_KEY_ID=$(echo "$CREDS_BODY" | jq -r .credentials.access_key_id)
@@ -337,7 +431,7 @@ runs:
             echo "::add-mask::$AWS_SESSION_TOKEN"
             export AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
             export AWS_DEFAULT_REGION="$REGION"
-            aws s3 sync "$DAGS_PATH/" "s3://${BUCKET}/${PREFIX}" \
+            aws s3 sync "$SRC/" "s3://${BUCKET}/${PREFIX}" \
               --delete \
               --exclude "._*" \
               --exclude ".DS_Store" \
@@ -352,7 +446,7 @@ runs:
             printf '%s' "$ACCESS_TOKEN" > "$TOKEN_FILE"
             # `gcloud storage rsync` needs SDK >= 449 (Sept 2023). GitHub
             # runners ship a newer version by default.
-            gcloud storage rsync "$DAGS_PATH/" "gs://${BUCKET}/${PREFIX}" \
+            gcloud storage rsync "$SRC/" "gs://${BUCKET}/${PREFIX}" \
               --recursive \
               --delete-unmatched-destination-objects \
               --access-token-file="$TOKEN_FILE" \
@@ -366,13 +460,13 @@ runs:
             echo "::add-mask::$SAS_URL"
             # `az storage blob upload-batch` parallel-uploads but does NOT
             # delete remote files that were removed locally. `azcopy sync`
-            # would; install it if you need delete-on-removal.
-            # Build the destination URL with the prefix path inserted before
-            # the SAS query string.
+            # would; install it if you need delete-on-removal. Cloud-side
+            # exclude flags don't exist on Azure's upload-batch, so any
+            # filtering must already be reflected in $SRC (pre-stage path).
             BASE_URL="${SAS_URL%%\?*}"
             SAS_QUERY="${SAS_URL#*\?}"
             az storage blob upload-batch \
-              --source "$DAGS_PATH" \
+              --source "$SRC" \
               --destination "${BASE_URL}" \
               --destination-path "${PREFIX%/}" \
               --sas-token "$SAS_QUERY" \
@@ -386,12 +480,12 @@ runs:
             ;;
         esac
 
-        FILE_COUNT=$(find "$DAGS_PATH" -type f \
+        FILE_COUNT=$(find "$SRC" -type f \
           ! -name '._*' ! -name '.DS_Store' \
           ! -path '*/__pycache__/*' ! -name '*.pyc' \
           | wc -l | tr -d ' ')
 
-        # 3. Tell the control plane the sync happened so it can update
+        # 5. Tell the control plane the sync happened so it can update
         #    deploy_mode + last_dag_sync_at. Best-effort: a failed callback
         #    leaves the data in place, only the bookkeeping drifts.
         COMPLETE=$(curl -sS -w '\n%{http_code}' -X POST \
