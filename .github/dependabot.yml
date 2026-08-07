@@ -1,0 +1,19 @@
+# Dependabot dependency scanning (SOC 2 — CC6/CC7). Mirrors the skaledata
+# monorepo policy (SKD-101): weekly, non-security updates grouped to keep PR
+# noise down; security-fix PRs still open immediately + out of band.
+version: 2
+updates:
+  # Composite action — keeps the nested actions referenced in action.yml's
+  # `uses:` steps up to date.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    groups:
+      actions-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
