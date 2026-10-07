@@ -25,11 +25,12 @@ jobs:
         with:
           fetch-depth: 0   # needed for diff-based change detection
 
-      - uses: skaledata/deploy-action@v2
+      - uses: skaledata/deploy-action@v3
         with:
           api-key: ${{ secrets.SKALEDATA_API_KEY }}
           cluster-id: your-cluster-public-id
           app-type: airflow
+          app-name: your-airflow-app   # optional if the cluster has one Airflow app
 ```
 
 > **Note on `fetch-depth`:** the default `actions/checkout` shallow clone (depth=1) doesn't include the previous commit, so change detection can't compute a diff and falls back to "rebuild everything". Use `fetch-depth: 0` (full history) or `fetch-depth: 2` (just enough for `HEAD^`) if you want change detection to work on push events.
@@ -41,6 +42,7 @@ jobs:
 | `api-key` | Yes | — | SkaleData API key (`sdk_...`) |
 | `cluster-id` | Yes | — | Cluster public ID from the SkaleData console |
 | `app-type` | Yes | `airflow` | Application type (`airflow`, `airbyte`, `docs`, `slackbot`, `superset`, `datahub`) |
+| `app-name` | No | — | App name from the SkaleData console. Required when the cluster has more than one app of `app-type`; otherwise the action targets the only one. |
 | `image-tag` | No | `${{ github.sha }}` | Docker image tag |
 | `dockerfile` | No | `./Dockerfile` | Path to Dockerfile |
 | `context` | No | `.` | Docker build context directory |
@@ -71,7 +73,7 @@ Override per repo as needed (e.g. add `Pipfile.lock`, drop `plugins/**` if you d
 | Output | Description |
 |--------|-------------|
 | `image` | Full image URI that was deployed (empty when image was not rebuilt) |
-| `status` | `deployed`, `upgrading`, or empty when rebuild was skipped |
+| `status` | `deployed` (rolling restart started) or `deploying` (Helm upgrade queued, for example on an app's first custom image). Empty when the image wasn't rebuilt. |
 | `image-rebuilt` | `true` if an image build + deploy ran this invocation |
 | `dag-files-uploaded` | Number of DAG files uploaded to blob storage |
 | `dag-sync-url` | Blob storage URL DAGs synced to |
@@ -82,8 +84,9 @@ Override per repo as needed (e.g. add `Pipfile.lock`, drop `plugins/**` if you d
 2. **Image path** (only if `image-rebuild=true` and `skip-build != true`):
     - Mint short-lived registry credentials from the SkaleData API
     - Log in to the cluster's container registry (GCP Artifact Registry / AWS ECR / Azure ACR)
-    - Build and push the image (`:<sha>` + `:latest`)
-    - Trigger rolling restart or first-time Terraform upgrade via `POST /clusters/{id}/deploy-image`
+    - Build and push the image (`:<sha>`, `:latest`, and `:current`) to the app's repository, `<registry>/<app name>`, which the API returns
+    - Trigger a rolling restart, or a Helm upgrade on the app's first custom image, via `POST /clusters/{id}/deploy-image`
+    - Fail if the image `deploy-image` recorded isn't the one that was pushed
 3. **DAG path** (always, unless `skip-dag-upload=true`):
     - Tar the `dags-path` folder
     - `POST /clusters/{id}/upload-dags` with the tar.gz + `app_type`
