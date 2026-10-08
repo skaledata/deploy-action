@@ -15,6 +15,13 @@ inputs:
     description: 'Application type (airflow, airbyte, docs, slackbot, superset, datahub)'
     required: true
     default: 'airflow'
+  app-name:
+    description: |
+      Name of the app to deploy to, as shown in the SkaleData console. Needed when the
+      cluster has more than one app of app-type. If omitted, the action targets the
+      cluster's only app of app-type.
+    required: false
+    default: ''
   image-tag:
     description: 'Docker image tag (defaults to git SHA)'
     required: false
@@ -103,7 +110,7 @@ outputs:
     description: 'Full image URI that was deployed (empty if image was not rebuilt)'
     value: ${{ steps.deploy.outputs.image }}
   status:
-    description: 'deploy-image status (deployed, upgrading, or skipped)'
+    description: 'deploy-image status: deployed (rolling restart) or deploying (Helm upgrade queued). Empty when the image was not rebuilt.'
     value: ${{ steps.deploy.outputs.status }}
   image-rebuilt:
     description: 'true if an image build + deploy-image ran this invocation, false otherwise'
@@ -217,18 +224,40 @@ runs:
       id: auth
       if: steps.detect.outputs.image-rebuild == 'true' && inputs.skip-build != 'true'
       shell: bash
+      env:
+        API_URL: ${{ inputs.api-url }}
+        API_KEY: ${{ inputs.api-key }}
+        CLUSTER_ID: ${{ inputs.cluster-id }}
+        APP_TYPE: ${{ inputs.app-type }}
+        APP_NAME: ${{ inputs.app-name }}
       run: |
-        CREDS=$(curl -sf -X POST \
-          "${{ inputs.api-url }}/clusters/${{ inputs.cluster-id }}/registry-token" \
-          -H "Authorization: Bearer ${{ inputs.api-key }}")
+        # Naming the app makes the API return the repository its pods pull
+        # from (<registry>/<app name>) and, on AWS, create it before the push.
+        QUERY=$(jq -rn --arg t "$APP_TYPE" --arg n "$APP_NAME" \
+          '"app_type=\($t | @uri)" + (if $n != "" then "&app_name=\($n | @uri)" else "" end)')
+        RESPONSE=$(curl -sS -w '\n%{http_code}' -X POST \
+          "$API_URL/clusters/$CLUSTER_ID/registry-token?$QUERY" \
+          -H "Authorization: Bearer $API_KEY")
+        HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+        CREDS=$(echo "$RESPONSE" | sed '$d')
 
-        if [ $? -ne 0 ] || [ -z "$CREDS" ]; then
-          echo "::error::Failed to get registry credentials from SkaleData API"
+        if [ "$HTTP_CODE" != "200" ] || [ -z "$CREDS" ]; then
+          DETAIL=$(echo "$CREDS" | jq -r '.detail // "Unknown error"' 2>/dev/null || echo "HTTP $HTTP_CODE")
+          echo "::error::Failed to get registry credentials from SkaleData API: $DETAIL (HTTP $HTTP_CODE)"
           exit 1
         fi
 
+        # An API that predates image_repository ignores the query. Build the
+        # path the old way then, which is right only when app-name is set or
+        # the app is named after its type.
+        IMAGE_REPOSITORY=$(echo "$CREDS" | jq -r '.image_repository // ""')
+        if [ -z "$IMAGE_REPOSITORY" ]; then
+          IMAGE_REPOSITORY="$(echo "$CREDS" | jq -r .artifact_registry_url)/${APP_NAME:-$APP_TYPE}"
+        fi
+
         echo "registry=$(echo "$CREDS" | jq -r .registry)" >> "$GITHUB_OUTPUT"
-        echo "ar_url=$(echo "$CREDS" | jq -r .artifact_registry_url)" >> "$GITHUB_OUTPUT"
+        echo "image_repository=$IMAGE_REPOSITORY" >> "$GITHUB_OUTPUT"
+        echo "app_name=$(echo "$CREDS" | jq -r '.app_name // ""')" >> "$GITHUB_OUTPUT"
         echo "username=$(echo "$CREDS" | jq -r .username)" >> "$GITHUB_OUTPUT"
 
         # Mask the token so it never appears in logs
@@ -248,8 +277,11 @@ runs:
     - name: Build and push image
       if: steps.detect.outputs.image-rebuild == 'true' && inputs.skip-build != 'true'
       shell: bash
+      env:
+        IMAGE_REPOSITORY: ${{ steps.auth.outputs.image_repository }}
+        IMAGE_TAG: ${{ inputs.image-tag }}
       run: |
-        IMAGE="${{ steps.auth.outputs.ar_url }}/${{ inputs.app-type }}:${{ inputs.image-tag }}"
+        IMAGE="$IMAGE_REPOSITORY:$IMAGE_TAG"
 
         BUILD_ARGS=""
         if [ -n "${{ inputs.build-args }}" ]; then
@@ -258,11 +290,11 @@ runs:
           done <<< "${{ inputs.build-args }}"
         fi
 
-        LATEST="${{ steps.auth.outputs.ar_url }}/${{ inputs.app-type }}:latest"
+        LATEST="$IMAGE_REPOSITORY:latest"
         # SkaleData's helm chart pins defaultAirflowTag to "current" with
         # imagePullPolicy: Always, so the rolling restart that deploy-image
         # triggers will only pick up new code if :current actually moved.
-        CURRENT="${{ steps.auth.outputs.ar_url }}/${{ inputs.app-type }}:current"
+        CURRENT="$IMAGE_REPOSITORY:current"
 
         docker build \
           -f "${{ inputs.dockerfile }}" \
@@ -281,13 +313,25 @@ runs:
       id: deploy
       if: steps.detect.outputs.image-rebuild == 'true' && inputs.skip-build != 'true'
       shell: bash
+      env:
+        API_URL: ${{ inputs.api-url }}
+        API_KEY: ${{ inputs.api-key }}
+        CLUSTER_ID: ${{ inputs.cluster-id }}
+        APP_TYPE: ${{ inputs.app-type }}
+        # The app registry-token resolved, so the deploy targets the app the
+        # image was pushed for.
+        APP_NAME: ${{ inputs.app-name || steps.auth.outputs.app_name }}
+        IMAGE_TAG: ${{ inputs.image-tag }}
+        IMAGE_REPOSITORY: ${{ steps.auth.outputs.image_repository }}
       run: |
+        DEPLOY_BODY=$(jq -cn --arg t "$APP_TYPE" --arg n "$APP_NAME" --arg tag "$IMAGE_TAG" \
+          '{app_type: $t, image_tag: $tag} + (if $n != "" then {app_name: $n} else {} end)')
         for ATTEMPT in 1 2 3; do
           RESPONSE=$(curl -sw '\n%{http_code}' -X POST \
-            "${{ inputs.api-url }}/clusters/${{ inputs.cluster-id }}/deploy-image" \
-            -H "Authorization: Bearer ${{ inputs.api-key }}" \
+            "$API_URL/clusters/$CLUSTER_ID/deploy-image" \
+            -H "Authorization: Bearer $API_KEY" \
             -H "Content-Type: application/json" \
-            -d '{"app_type": "${{ inputs.app-type }}", "image_tag": "${{ inputs.image-tag }}"}')
+            -d "$DEPLOY_BODY")
 
           HTTP_CODE=$(echo "$RESPONSE" | tail -1)
           BODY=$(echo "$RESPONSE" | sed '$d')
@@ -311,11 +355,25 @@ runs:
         echo "status=$STATUS" >> "$GITHUB_OUTPUT"
         echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
 
-        if [ "$STATUS" = "upgrading" ]; then
-          echo "::notice::First custom image deploy — Terraform upgrade in progress (~3-5 min)"
-        else
-          echo "::notice::Rolling restart triggered — pods updating now"
+        # The pods pull what deploy-image recorded. If that isn't where the
+        # image was pushed, they can't pull it.
+        if [[ "$IMAGE" != "$IMAGE_REPOSITORY:"* ]]; then
+          echo "::error::The image was pushed to $IMAGE_REPOSITORY, but the app pulls $IMAGE. Set app-name to the app's name in the SkaleData console and rerun."
+          exit 1
         fi
+
+        case "$STATUS" in
+          deployed)
+            echo "::notice::Rolling restart triggered — pods are pulling $IMAGE now"
+            ;;
+          deploying|upgrading)
+            # `upgrading` is what older APIs returned for the same path.
+            echo "::notice::Helm upgrade queued to switch the app to $IMAGE — pods roll when the job runs (~3-5 min)"
+            ;;
+          *)
+            echo "::warning::deploy-image returned unexpected status '$STATUS' for $IMAGE"
+            ;;
+        esac
 
     - name: Mark deploy skipped
       id: deploy-skip
@@ -329,6 +387,8 @@ runs:
       if: inputs.skip-dag-upload != 'true'
       shell: bash
       env:
+        APP_TYPE: ${{ inputs.app-type }}
+        APP_NAME: ${{ inputs.app-name }}
         RESPECT_GITIGNORE: ${{ inputs.respect-gitignore }}
         EXTRA_EXCLUDES: ${{ inputs.extra-excludes }}
         EXTRA_INCLUDES: ${{ inputs.extra-includes }}
@@ -403,6 +463,11 @@ runs:
           SRC="$STAGE"
         fi
 
+        # Names the app when app-name is set; the API otherwise targets the
+        # cluster's only app of app-type.
+        APP_TARGET=$(jq -cn --arg t "$APP_TYPE" --arg n "$APP_NAME" \
+          '{app_type: $t} + (if $n != "" then {app_name: $n} else {} end)')
+
         STAGED_COUNT=$(find "$SRC" -type f 2>/dev/null | wc -l | tr -d ' ')
         echo "::notice::Source set: $STAGED_COUNT files ready to sync"
 
@@ -413,7 +478,7 @@ runs:
           "${{ inputs.api-url }}/clusters/${{ inputs.cluster-id }}/dag-sync-credentials" \
           -H "Authorization: Bearer ${{ inputs.api-key }}" \
           -H "Content-Type: application/json" \
-          -d "{\"app_type\":\"${{ inputs.app-type }}\"}")
+          -d "$APP_TARGET")
         CREDS_CODE=$(echo "$CREDS" | tail -1)
         CREDS_BODY=$(echo "$CREDS" | sed '$d')
         if [ "$CREDS_CODE" != "200" ]; then
@@ -520,7 +585,7 @@ runs:
           "${{ inputs.api-url }}/clusters/${{ inputs.cluster-id }}/dag-sync-complete" \
           -H "Authorization: Bearer ${{ inputs.api-key }}" \
           -H "Content-Type: application/json" \
-          -d "{\"app_type\":\"${{ inputs.app-type }}\",\"files_uploaded\":${FILE_COUNT}}" || true)
+          -d "$(echo "$APP_TARGET" | jq -c --argjson n "$FILE_COUNT" '. + {files_uploaded: $n}')" || true)
         COMPLETE_CODE=$(echo "$COMPLETE" | tail -1)
         if [ "$COMPLETE_CODE" != "200" ]; then
           echo "::warning::DAGs uploaded but control-plane callback returned HTTP $COMPLETE_CODE"
